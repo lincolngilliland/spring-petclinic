@@ -4,7 +4,11 @@ param(
     [double]$TargetBranchCoverage = 80.0,
     [string]$TestGenerationCommand = '',
     [string]$FailureFixCommand = '',
-    [switch]$StopOnTestFailure
+    [switch]$StopOnTestFailure,
+    [switch]$AutoCommit,
+    [switch]$AutoPush,
+    [string]$CommitScope = '.',
+    [string]$CommitMessagePrefix = 'test: coverage iteration'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,10 +45,62 @@ function Read-CoverageSummary {
     }
 }
 
+function Assert-GitReady {
+    if (-not (Test-Path -Path '.\\.git')) {
+        throw 'Current directory is not a Git repository. Run from repository root.'
+    }
+
+    if ($AutoPush) {
+        & git remote get-url origin *> $null
+        if ($LASTEXITCODE -ne 0) {
+            throw 'AutoPush requested but origin remote is not configured.'
+        }
+    }
+}
+
+function Commit-IterationProgress {
+    param(
+        [int]$Iteration,
+        [double]$LinePct,
+        [double]$BranchPct,
+        [double]$MethodPct,
+        [string]$Status
+    )
+
+    & git add -- $CommitScope
+
+    & git diff --cached --quiet
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host 'No commit created: no staged changes for this iteration.'
+        return ''
+    }
+
+    $message = "{0} {1}: line {2}% branch {3}% method {4}% [{5}]" -f $CommitMessagePrefix, $Iteration, $LinePct, $BranchPct, $MethodPct, $Status
+    & git commit -m $message
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Git commit failed.'
+    }
+
+    $sha = (& git rev-parse --short HEAD).Trim()
+
+    if ($AutoPush) {
+        & git push
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Git push failed.'
+        }
+    }
+
+    return $sha
+}
+
 $maven = Get-MavenWrapper
 $parser = '.\\parse-jacoco-lines.ps1'
 if (-not (Test-Path -Path $parser)) {
     throw "Parser script '$parser' was not found."
+}
+
+if ($AutoCommit -or $AutoPush) {
+    Assert-GitReady
 }
 
 $runDir = 'target\\coverage-loop'
@@ -54,7 +110,7 @@ if (-not (Test-Path -Path $runDir)) {
 
 $csvPath = Join-Path $runDir 'iterations.csv'
 if (-not (Test-Path -Path $csvPath)) {
-    'iteration,timestamp,linePct,branchPct,methodPct,status,notes' | Set-Content -Path $csvPath -Encoding utf8
+    'iteration,timestamp,linePct,branchPct,methodPct,status,notes,commitSha' | Set-Content -Path $csvPath -Encoding utf8
 }
 
 for ($i = 1; $i -le $MaxIterations; $i++) {
@@ -99,7 +155,12 @@ for ($i = 1; $i -le $MaxIterations; $i++) {
     $coverage = Read-CoverageSummary -JsonPath $jsonPath
     Write-Host ("Coverage: line={0}% branch={1}% method={2}%" -f $coverage.linePct, $coverage.branchPct, $coverage.methodPct)
 
-    "$i,$((Get-Date).ToString('o')),$($coverage.linePct),$($coverage.branchPct),$($coverage.methodPct),$status,$notes" |
+    $commitSha = ''
+    if ($AutoCommit -and $status -notlike 'TEST_FAIL*') {
+        $commitSha = Commit-IterationProgress -Iteration $i -LinePct $coverage.linePct -BranchPct $coverage.branchPct -MethodPct $coverage.methodPct -Status $status
+    }
+
+    "$i,$((Get-Date).ToString('o')),$($coverage.linePct),$($coverage.branchPct),$($coverage.methodPct),$status,$notes,$commitSha" |
         Add-Content -Path $csvPath -Encoding utf8
 
     if ($coverage.linePct -ge $TargetLineCoverage -and $coverage.branchPct -ge $TargetBranchCoverage -and $status -notlike 'TEST_FAIL*') {
